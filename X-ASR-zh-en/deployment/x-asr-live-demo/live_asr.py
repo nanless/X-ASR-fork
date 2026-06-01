@@ -24,6 +24,7 @@ import os
 import re
 import shutil
 import sys
+import tempfile
 import time
 import unicodedata
 
@@ -73,6 +74,17 @@ def normalize_cjk(text):
     text = re.sub(rf"(?<=[{_CJK_PUNCT}])\s+(?=[{_CJK_PUNCT}])", "", text)
     text = re.sub(rf"\s+(?=[{_ASCII_PUNCT}])", "", text)
     return text
+
+
+def _make_bpe_vocab(tokens_file):
+    """Create a temporary bpe_vocab file from tokens.txt for hotwords support."""
+    fd, path = tempfile.mkstemp(suffix=".txt", prefix="bpe_vocab_")
+    with open(tokens_file) as fin, open(fd, "w") as fout:
+        for line in fin:
+            parts = line.strip().split()
+            if len(parts) >= 2:
+                fout.write(f"{parts[0]} 0.0\n")
+    return path
 
 
 # --------------------------------------------------------------------------- #
@@ -219,17 +231,31 @@ def find_asr_files(asr_dir):
     return "wenet-ctc", dict(tokens=tokens, model=model)
 
 
-def build_recognizer(asr_dir, asr_type, provider, model_type=""):
+def build_recognizer(asr_dir, asr_type, provider, model_type="",
+                     hotwords_file="", hotwords_score=1.5):
     kind, files = find_asr_files(asr_dir)
     if asr_type != "auto":
         kind = asr_type
     print(f"[ASR] type={kind}  provider={provider}  model_type={model_type or 'auto'}")
     for k, v in files.items():
         print(f"      {k}: {v}")
+    if hotwords_file:
+        print(f"      hotwords: {hotwords_file}  score={hotwords_score}")
     common = dict(num_threads=2, provider=provider, decoding_method="greedy_search",
                   enable_endpoint_detection=False)  # endpointing is handled by the VAD
+    bpe_vocab_path = ""
+    modeling_unit = ""
+    if hotwords_file:
+        common["decoding_method"] = "modified_beam_search"
+        modeling_unit = "bpe"
+        bpe_vocab_path = _make_bpe_vocab(files["tokens"])
+        print(f"      decoding: modified_beam_search (required for hotwords)")
+        print(f"      bpe_vocab: {bpe_vocab_path}")
     if kind == "transducer":
-        return sherpa_onnx.OnlineRecognizer.from_transducer(**files, model_type=model_type, **common)
+        return sherpa_onnx.OnlineRecognizer.from_transducer(
+            **files, model_type=model_type, **common,
+            hotwords_file=hotwords_file, hotwords_score=hotwords_score,
+            modeling_unit=modeling_unit, bpe_vocab=bpe_vocab_path)
     if kind == "wenet-ctc":
         return sherpa_onnx.OnlineRecognizer.from_wenet_ctc(
             tokens=files["tokens"], model=files["model"],
@@ -449,6 +475,10 @@ def main():
     ap.add_argument("--preroll", type=float, default=0.7,
                     help="sentence-start re-feed (s): recovers the start eaten by VAD onset latency; "
                          "increase if starts are clipped")
+    ap.add_argument("--hotwords-file", type=str, default="",
+                    help="path to hotwords file; each line: word [score]")
+    ap.add_argument("--hotwords-score", type=float, default=1.5,
+                    help="boosting score for hotwords (default: 1.5)")
     args = ap.parse_args()
 
     if args.list_devices:
@@ -456,7 +486,8 @@ def main():
         print(sd.query_devices())
         return
 
-    recognizer = build_recognizer(args.asr_dir, args.asr_type, args.provider, args.model_type)
+    recognizer = build_recognizer(args.asr_dir, args.asr_type, args.provider, args.model_type,
+                                   args.hotwords_file, args.hotwords_score)
     vad = build_vad(args.vad, args.vad_model, args.vad_threshold, args.vad_min_silence,
                     args.vad_min_speech, args.energy_threshold, args.provider)
     fmt = (lambda s: s) if args.no_cjk_normalize else normalize_cjk

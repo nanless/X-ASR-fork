@@ -1,0 +1,4 @@
+sherpa-onnx>=1.13.2
+numpy
+sounddevice
+pyobjc-framework-Quartz

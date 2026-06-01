@@ -38,6 +38,10 @@ def get_parser():
     parser.add_argument("--model-type", type=str, default="zipformer2")
     parser.add_argument("--enable-endpoint-detection", type=int, default=0)
     parser.add_argument("--text-format", type=str, default="lower")  # none/lower/capitalize
+    parser.add_argument("--hotwords-file", type=str, default="",
+                        help="path to hotwords file; each line: word [score]")
+    parser.add_argument("--hotwords-score", type=float, default=1.5,
+                        help="boosting score for hotwords (default: 1.5)")
     return parser
 
 
@@ -61,6 +65,8 @@ def build_asr(args) -> SherpaStreamingASR:
         model_type=args.model_type,
         enable_endpoint_detection=bool(args.enable_endpoint_detection),
         text_format=args.text_format,
+        hotwords_file=args.hotwords_file,
+        hotwords_score=args.hotwords_score,
     )
 
 

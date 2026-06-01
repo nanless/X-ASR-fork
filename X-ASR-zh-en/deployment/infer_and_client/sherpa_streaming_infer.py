@@ -3,6 +3,7 @@
 
 import re
 import time
+import tempfile
 from dataclasses import dataclass
 from typing import Optional
 
@@ -32,6 +33,17 @@ def format_text(text: str, mode: str = "none") -> str:
     return _normalize_cjk_spacing(text)
 
 
+def _make_bpe_vocab(tokens_file: str) -> str:
+    """Create a temporary bpe_vocab file from tokens.txt for hotwords support."""
+    fd, path = tempfile.mkstemp(suffix=".txt", prefix="bpe_vocab_")
+    with open(tokens_file) as fin, open(fd, "w") as fout:
+        for line in fin:
+            parts = line.strip().split()
+            if len(parts) >= 2:
+                fout.write(f"{parts[0]} 0.0\n")
+    return path
+
+
 @dataclass
 class StreamingStats:
     start_time: Optional[float] = None
@@ -57,6 +69,8 @@ class SherpaStreamingASR:
         model_type: str = "zipformer2",
         enable_endpoint_detection: bool = False,
         text_format: str = "none",   # none / lower / capitalize
+        hotwords_file: str = "",
+        hotwords_score: float = 1.5,
     ):
         self.tokens = tokens
         self.encoder = encoder
@@ -70,6 +84,17 @@ class SherpaStreamingASR:
         self.model_type = model_type
         self.enable_endpoint_detection = enable_endpoint_detection
         self.text_format = text_format
+        self.hotwords_file = hotwords_file
+        self.hotwords_score = hotwords_score
+
+        if self.hotwords_file and self.decoding_method == "greedy_search":
+            self.decoding_method = "modified_beam_search"
+
+        bpe_vocab_path = ""
+        modeling_unit = ""
+        if self.hotwords_file:
+            modeling_unit = "bpe"
+            bpe_vocab_path = _make_bpe_vocab(self.tokens)
 
         self.recognizer = sherpa_onnx.OnlineRecognizer.from_transducer(
             tokens=self.tokens,
@@ -83,6 +108,10 @@ class SherpaStreamingASR:
             provider=self.provider,
             model_type=self.model_type,
             enable_endpoint_detection=self.enable_endpoint_detection,
+            hotwords_file=self.hotwords_file,
+            hotwords_score=self.hotwords_score,
+            modeling_unit=modeling_unit,
+            bpe_vocab=bpe_vocab_path,
         )
 
         self.stats = StreamingStats()
