@@ -31,6 +31,7 @@
 
 <p align="center">
   <a href="https://huggingface.co/GilgameshWind/X-ASR-zh-en">🤗 Hugging Face</a> |
+  <a href="https://www.modelscope.ai/Gilgamesh-J/X-ASR-zh-en">🧩 ModelScope</a> |
   <a href="https://huggingface.co/spaces/chenxie95/X-ASR">🪐 Hugging Face Space</a> |
   <a href="https://stream-asr.sjtuxlance.com/">🎧 在线 Demo</a> |
   <a href="X-ASR-zh-en/deployment/x-asr-live-demo/README_zh.md">🎙️ 本地实时 Demo</a> |
@@ -55,7 +56,8 @@
   <a href="#模型发布">📦 模型发布</a> |
   <a href="#应用示例">🎙️ 应用示例</a> |
   <a href="#评测结果">📊 评测结果</a> |
-  <a href="#快速开始">🚀 快速开始</a>
+  <a href="#快速开始">🚀 快速开始</a> |
+  <a href="#仓库结构">🗂️ 仓库结构</a>
 </p>
 
 ---
@@ -93,7 +95,7 @@
 
 | 模型 | 语言 | 类型 | 流式 chunk | 部署 | 工作报告 | 模型文件 |
 |:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| `X-ASR-zh-en` | 中文、英文 | 离线-流式一体化 transducer ASR | 160 ms, 480 ms, 960 ms, 1920 ms | sherpa-onnx | **Coming Soon** | [GitHub](X-ASR-zh-en/deployment), [Hugging Face](https://huggingface.co/GilgameshWind/X-ASR-zh-en) |
+| `X-ASR-zh-en` | 中文、英文 | 离线-流式一体化 transducer ASR | 160 ms, 480 ms, 960 ms, 1920 ms | sherpa-onnx | **Coming Soon** | [GitHub](X-ASR-zh-en/deployment), [Hugging Face](https://huggingface.co/GilgameshWind/X-ASR-zh-en), [ModelScope](https://www.modelscope.ai/Gilgamesh-J/X-ASR-zh-en) |
 
 ## ⭐ 核心特性
 
@@ -143,6 +145,30 @@
     </td>
   </tr>
 </table>
+
+### ⬇️ 桌面应用下载
+
+<p align="center">
+  <img src="assets/applications/vibe-xasr/icon.png" width="88" alt="Vibe XASR app icon">
+  <br>
+  <b>Vibe XASR</b> · 基于 X-ASR 的本地语音输入法
+  <br><br>
+  <a href="https://github.com/Gilgamesh-J/X-ASR/releases"><b>⬇️&nbsp; 下载 macOS 版 &nbsp;→</b></a>
+  <br>
+  <sub>Universal(Apple Silicon + Intel)· macOS 15.0+ · 已签名公证 · App 内自动更新</sub>
+</p>
+
+> **按住热键说话,文字直接落到光标处 —— 100% 本地、离线,数据永不出设备。** 由 X-ASR 流式引擎驱动,中英文混说无缝切换、实时上屏,全系统通用。
+
+**核心功能**
+
+- 🎙️ **三种听写模式** —— 说完插入 · 逐字流式(边说边上屏)· OnCall 持续候机(悬浮窗)
+- 📋 **内置便签 + 历史记录** —— 按日期保存,复制 / 编辑 / 导出
+- 📖 **个性化词典** —— 热词、同音字纠正、替换规则
+- ✨ **AI 润色(Beta)** —— 可选云端大模型顺句、去口水词(默认关闭,需手动开启)
+- 🔒 **隐私优先 + 自动更新** —— 全程离线;App 内一键升级
+
+<sub>🪟 也提供 **Windows 版**(见 [Releases](https://github.com/Gilgamesh-J/X-ASR/releases))—— 早期**预览版**,尚未充分测试,会持续同步 macOS 最新功能;遇到问题欢迎及时[提交反馈](https://github.com/Gilgamesh-J/X-ASR/issues)。</sub>
 
 <a id="评测结果"></a>
 
@@ -338,6 +364,10 @@ Demo 视频：
 
 本仓库使用 **Git LFS** 管理 ONNX 模型文件和 demo 媒体文件。克隆或拉取大文件前需要先安装并初始化 Git LFS。
 
+#### GitHub
+
+如果需要完整项目仓库、中英文文档、训练参考、部署示例和 issue 跟踪，请使用 GitHub。
+
 ```bash
 git lfs install
 git clone https://github.com/Gilgamesh-J/X-ASR.git
@@ -345,17 +375,43 @@ cd X-ASR
 git lfs pull
 ```
 
-也可以从 Hugging Face 下载模型文件：
+#### Hugging Face
+
+如果需要模型 artifact 页面以及标准 Hugging Face Hub 下载工具，请使用 Hugging Face。
 
 ```bash
 hf download GilgameshWind/X-ASR-zh-en \
-  --local-dir ./X-ASR-zh-en/deployment
+  --local-dir ./X-ASR-zh-en
+```
+
+#### ModelScope
+
+如果希望使用 ModelScope 镜像或从 ModelScope 通过 Git LFS 克隆，请使用 ModelScope。
+
+```bash
+git lfs install
+git clone https://www.modelscope.ai/Gilgamesh-J/X-ASR-zh-en.git
+cd X-ASR-zh-en
+git lfs pull
 ```
 
 ### 2. 准备 sherpa-onnx 运行环境
 
+如果你克隆的是完整 GitHub 项目，进入：
+
+```bash
+cd X-ASR/X-ASR-zh-en/deployment
+```
+
+如果你从 Hugging Face 下载，或从 ModelScope 克隆，进入：
+
 ```bash
 cd X-ASR-zh-en/deployment
+```
+
+然后准备 Python 环境：
+
+```bash
 python -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
@@ -412,6 +468,8 @@ python infer_and_client/sherpa_streaming_client.py \
 | 3 | JSON: `{"type": "end"}` | 结束本次会话并输出 final 结果 |
 
 更完整的部署说明见 [X-ASR-zh-en/deployment/README.md](X-ASR-zh-en/deployment/README.md)。
+
+<a id="仓库结构"></a>
 
 ## 🗂️ 仓库结构
 

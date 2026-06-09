@@ -1,0 +1,1390 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Windows.Forms;
+using NAudio.Wave;
+using NAudio.Wave.SampleProviders;
+using VibeXASR.Windows.Dictation;
+using VibeXASR.Windows.Input;
+using System.Text.Json;
+using VibeXASR.Windows.Lexicon;
+using VibeXASR.Windows.Sharing;
+using VibeXASR.Windows.Models;
+using VibeXASR.Windows.Storage;
+using VibeXASR.Windows.Ui;
+using VibeXASR.Windows.Refine;
+
+namespace VibeXASR.Windows;
+
+/// <summary>
+/// Owns the whole runtime — tray icon + menu/popup, the dictation engine, the mic, the
+/// global hotkey, the overlay, and the Settings/History windows. The Windows analogue of
+/// the macOS AppDelegate / status-item controller. Implements <see cref="IAppController"/>
+/// so every window writes its changes back here and they apply live.
+/// </summary>
+public sealed class TrayApp : IDisposable, IAppController
+{
+    public ApplicationContext Context { get; } = new();
+
+    private readonly Settings _settings;
+    private readonly HistoryStore _history = new();
+    private LocalApiServer? _api;   // v1.4.0 本地共享 API
+    private readonly PinyinNormalizer _pinyin = new();                                  // 词典: homophone correction
+    private IReadOnlyList<Replacements.Rule> _replaceRules = Array.Empty<Replacements.Rule>(); // 词典: replacements
+    private IReadOnlyList<Replacements.Rule> _snippetRules = Array.Empty<Replacements.Rule>(); // 口令: voice snippets
+    private readonly ModelManager _models;
+
+    private NotifyIcon? _tray;
+    private GlobalHotkey? _hotkey;
+    private MicCapture? _mic;
+    private DictationEngine? _engine;
+    private Ui.Wpf.OverlayWindow? _overlay;
+    private Ui.Wpf.TrayPopupWindow? _popup;
+    private Ui.Wpf.LauncherWindow? _launcher;
+    private Ui.Wpf.SettingsWindow? _settingsWpf;
+    private Ui.Wpf.HistoryWindow? _historyWpf;
+    private OnCallSessionForm? _onCallSessionForm;
+    private OnboardingForm? _onboarding;
+    private Ui.Wpf.DownloadWindow? _dl;
+    private CancellationTokenSource? _engineDlCts;   // cancels an in-flight tier download
+    private ModelTier _tierBeforeSwap;               // revert target if the user cancels the download
+
+    // Ephemeral transcript of the CURRENT OnCall session (cleared when a session starts) —
+    // distinct from the persistent _history store; this is what the overlay "View" button shows
+    // (macOS OnCallLog parity). Mutated on the engine worker thread, read on the UI thread.
+    private readonly List<HistoryEntry> _onCallSession = new();
+
+    private SynchronizationContext _ui = null!;
+    private string _typedSoFar = string.Empty;
+    // Post-insert actions (撤销 / 换模板重润色): the last inserted text + the raw ASR that produced it.
+    private string _lastInsertText = string.Empty;
+    private string _lastRawText = string.Empty;
+    private volatile bool _engineReady;
+    private volatile bool _engineSwapping;
+    private bool _dictationEnabled = true;
+    private volatile bool _listening;
+    private volatile bool _engineError;    // engine/model load failed → tray shows the error tint
+    private volatile float _holdPeakRms;   // loudest mic level seen during the current hold (diagnostics)
+    private bool _announcedReady;          // show the "ready" tray prompt once per launch
+
+    public TrayApp()
+    {
+        _settings = Settings.Load();
+        _tierBeforeSwap = _settings.Tier;
+        _models = new ModelManager(_settings);
+        L10n.Current = L10n.FromCode(_settings.Language);
+        Theme.IsDark = true; // dark-first like macOS; respect system below
+        Theme.IsDark = DetectDark();
+    }
+
+    public void Start()
+    {
+        _ui = SynchronizationContext.Current ?? new WindowsFormsSynchronizationContext();
+
+        _overlay = new Ui.Wpf.OverlayWindow();
+        _overlay.SetStaySeconds(_settings.HudStaySeconds);
+        _overlay.CopyRequested += (_, _) => CopyOverlayText();
+        _overlay.StopRequested += (_, _) => SetMode(DictationMode.Paste); // leave OnCall
+        _overlay.ViewRequested += (_, _) => OpenOnCallSession();
+        _overlay.PauseRequested += (_, _) => TogglePause();
+        _overlay.UndoRequested += (_, _) => UndoLastInsert();
+        _overlay.RepolishRequested += (_, id) => RepolishLast(id);
+        // Realize the overlay handle so cross-thread BeginInvoke works immediately.
+        _ = _overlay.Handle;
+
+        _popup = new Ui.Wpf.TrayPopupWindow(this);
+
+        BuildTray();
+        RefreshCorrections();   // 词典: load homophone table + replacement rules
+        ConfigureRefiner();     // AI 润色: configure the cloud refiner from settings
+        CueSound.Shared.SetVolume(_settings.CueVolume);   // 提示音: sync cue volume from settings
+        _api = new LocalApiServer(_settings, _history);   // 共享: local read-only HTTP API
+        _api.Restart(_settings.ApiEnabled, _settings.ApiPort, _settings.ApiAllowLAN);
+
+        _hotkey = new GlobalHotkey(_settings.HotkeyVk, _settings.HotkeyMods);
+        _hotkey.KeyDown += (_, _) => OnHotkeyDown();
+        _hotkey.KeyUp += (_, _) => OnHotkeyUp();
+        _hotkey.TemplateDown += (_, id) => OnTemplateHotkeyDown(id);
+        _hotkey.TemplateUp += (_, id) => OnTemplateHotkeyUp(id);   // follows the same trigger mode as the main key
+        RefreshTemplateHotkeys();
+        _hotkey.Install();
+
+        // Optional launch hook: VIBEXASR_OPEN=settings|history|popup opens that window at
+        // startup (used for verification, and the seam for a future single-instance "show
+        // settings"). In that mode we skip the engine bootstrap so no download dialog overlaps.
+        var openRaw = Environment.GetEnvironmentVariable("VIBEXASR_OPEN")?.ToLowerInvariant();
+        var open = openRaw?.Split(':')[0];
+        var openArg = openRaw is not null && openRaw.Contains(':') ? openRaw.Split(':', 2)[1] : null;
+        // Normal launch starts the engine; "popup"/"rebind" also do (they need real engine state).
+        // settings/history/overlay hooks skip it for clean screenshots.
+        if (string.IsNullOrEmpty(open) || open is "popup" or "rebind")
+            _ = EnsureEngineAsync(swapping: false);
+        // Auto-update (WinSparkle): start automatic daily checks on a normal launch only —
+        // never during the screenshot/test hooks (settings/history/overlay/selftest…).
+        if (string.IsNullOrEmpty(open))
+            Updater.Initialize(_ui, Quit);
+        // First launch ever: show the onboarding guide IMMEDIATELY (don't wait for the engine) —
+        // the user needs to know the app is in the bottom-right tray and that the engine is still
+        // preparing. The guide shows a live "preparing → ready" status.
+        if (string.IsNullOrEmpty(open) && !_settings.Welcomed)
+            ShowOnboarding();
+        // Desktop floating launcher (so users can always find the app). Normal launch only.
+        if (string.IsNullOrEmpty(open) && _settings.LauncherEnabled)
+            ShowLauncher();
+        switch (open)
+        {
+            case "settings": OpenSettings(openArg); break;
+            case "history": OpenHistory(); break;
+            case "popup": _popup?.ShowNear(); break;
+            case "rebind": SetHotkey(int.TryParse(openArg, out var vk) ? vk : 0x78, 0); break; // live-rebind self-test
+            case "selftest": _ = SelfTestAsync(openArg); break; // feed a WAV through the engine
+            case "mictest": _ = MicTestAsync(); break; // capture real mic → save WAV → run ASR
+            case "checkupdate": Updater.Initialize(_ui, Quit); Updater.CheckForUpdatesUi(); break; // WinSparkle UI
+            case "onboard": ShowOnboarding(); break; // preview the first-run guide
+            case "dicttest": RunDictTest(); break; // 词典 post-processor validation
+            case "oncallsession": // populate a fake current-session log + open the session transcript view
+                lock (_onCallSession)
+                {
+                    _onCallSession.Add(new HistoryEntry { Text = "把这个 function 改成 async。", Mode = "oncall", Timestamp = DateTimeOffset.Now.AddSeconds(-42) });
+                    _onCallSession.Add(new HistoryEntry { Text = "顺便帮我加一个错误处理,别让它直接崩。", Mode = "oncall", Timestamp = DateTimeOffset.Now.AddSeconds(-18) });
+                    _onCallSession.Add(new HistoryEntry { Text = "Then write a unit test for the parser.", Mode = "oncall", Timestamp = DateTimeOffset.Now });
+                }
+                OpenOnCallSession();
+                break;
+            case "overlay":
+                _listening = true;
+                _overlay?.ShowListening();
+                _overlay?.SetLevel(0.7);
+                _overlay?.SetText(openArg == "oncall" ? ""
+                    : "把这个 function 改成 async,顺手把错误处理也补上,再写两句单元测试");
+                if (openArg == "oncall") _overlay?.ShowOnCall();
+                else if (openArg == "inserted") _overlay?.ShowInserted(autoHide: false, withUndo: true, withRepolish: true);
+                break;
+        }
+    }
+
+    // ---- tray icon + menus ----
+
+    private void BuildTray()
+    {
+        _tray = new NotifyIcon
+        {
+            Icon = Branding.AppIcon,
+            Visible = _settings.ShowTrayIcon,
+            Text = "Vibe XASR",
+        };
+        _tray.MouseClick += (_, e) =>
+        {
+            if (e.Button == MouseButtons.Left)
+            {
+                if (_popup is { IsVisible: true }) _popup.Hide();
+                else _popup?.ShowNear();
+            }
+        };
+
+        var menu = new ContextMenuStrip { Renderer = new DarkMenuRenderer(), Font = Theme.Ui(9.5f) };
+        menu.BackColor = Theme.Surface2;
+        menu.ForeColor = Theme.Text;
+        menu.Opening += (_, _) => RebuildTrayMenu(menu);
+        _tray.ContextMenuStrip = menu;
+        RebuildTrayMenu(menu);
+        UpdateTrayStatus();
+    }
+
+    private void RebuildTrayMenu(ContextMenuStrip menu)
+    {
+        menu.Items.Clear();
+
+        var enable = new ToolStripMenuItem(L10n.T("menu.enable")) { Checked = _dictationEnabled, CheckOnClick = true };
+        enable.Click += (_, _) => DictationEnabled = enable.Checked;
+        menu.Items.Add(enable);
+
+        menu.Items.Add(new ToolStripSeparator());
+
+        var mode = new ToolStripMenuItem(L10n.T("dict.mode"));
+        AddModeItem(mode, DictationMode.Paste, "dict.mode.paste.title");
+        AddModeItem(mode, DictationMode.Type, "dict.mode.type.title");
+        AddModeItem(mode, DictationMode.OnCall, "dict.mode.oncall.title");
+        menu.Items.Add(mode);
+
+        menu.Items.Add(new ToolStripSeparator());
+        menu.Items.Add(L10n.T("menu.history"), null, (_, _) => OpenHistory());
+        menu.Items.Add(L10n.T("menu.settings"), null, (_, _) => OpenSettings());
+        menu.Items.Add(L10n.T("studio.title"), null, (_, _) => OpenPromptStudio());
+        menu.Items.Add(L10n.Resolved is Lang.Zh or Lang.Hant ? "使用引导" : "Quick start guide", null, (_, _) => ShowOnboarding());
+        menu.Items.Add(new ToolStripSeparator());
+        menu.Items.Add(L10n.T("menu.quit"), null, (_, _) => Quit());
+    }
+
+    private void AddModeItem(ToolStripMenuItem parent, DictationMode m, string key)
+    {
+        var item = new ToolStripMenuItem(L10n.T(key)) { Checked = _settings.Mode == m, ForeColor = Theme.Text };
+        item.Click += (_, _) => SetMode(m);
+        parent.DropDownItems.Add(item);
+    }
+
+    // ---- model bootstrap / engine swap ----
+
+    private async Task EnsureEngineAsync(bool swapping)
+    {
+        if (swapping) _engineSwapping = true;
+        StopEngine();
+        try
+        {
+            var paths = ModelPaths.ForTier(_settings.Tier);
+            var vad = paths.ResolveVad(_settings.Vad);   // FireRed if bundled, else Silero
+            Diag.Log($"EnsureEngine tier={(int)_settings.Tier} vad={vad} " +
+                     $"asr={paths.AsrModelPresent()} vadPresent={paths.VadPresent(vad)}");
+            if (!paths.AsrModelPresent() || !paths.VadPresent(vad))
+            {
+                _engineDlCts?.Dispose();
+                _engineDlCts = new CancellationTokenSource();
+                var token = _engineDlCts.Token;
+                ShowDownloadDialog();
+                var dl = new ModelDownloader(ModelSourceX.From(_settings.ModelSource));
+                var prog = new Progress<DownloadProgress>(p =>
+                    _dl?.Report(p.Fraction ?? 0,
+                        $"{p.FileName}  ({p.FileIndex + 1}/{p.FileCount})"));
+                await dl.EnsureTierAsync(paths, prog, token);
+                // Silero downloads on demand; FireRed ships bundled (ResolveVad already degraded to
+                // Silero if FireRed was absent), so only Silero can need a fetch here.
+                if (vad == VadKind.Silero) await dl.EnsureVadAsync(paths.VadFileFor(vad), prog, token);
+                CloseDownloadDialog();
+            }
+            // Build the engine (565 MB model) OFF the UI thread so the app + hotkey stay
+            // responsive, then start the mic ON the UI thread (WASAPI is more stable owned by a
+            // pumping thread, and lets us hot-swap the device without a full reload).
+            await Task.Run(BuildEngineCore);
+            RunOnUi(() =>
+            {
+                StartMic();
+                _engineReady = true;
+                _engineError = false;
+                Diag.Log($"engine: READY (mic running={_mic?.IsRunning == true})");
+                if (_settings.Mode == DictationMode.OnCall) EnterOnCall();
+                _popup?.Invalidate();
+                UpdateTrayStatus();
+                AnnounceReady();
+            });
+        }
+        catch (OperationCanceledException)
+        {
+            CloseDownloadDialog();
+            Diag.Log("engine download cancelled by user → revert tier to " + (int)_tierBeforeSwap);
+            // revert to the previously-working tier so we don't keep retrying the cancelled one,
+            // then rebuild on it (it's already present, so no download).
+            if (_settings.Tier != _tierBeforeSwap)
+            {
+                _settings.Tier = _tierBeforeSwap; _settings.Save();
+                _ = EnsureEngineAsync(swapping: true);
+            }
+            else { RunOnUi(UpdateTrayStatus); }
+        }
+        catch (Exception ex)
+        {
+            CloseDownloadDialog();
+            Diag.Log("ENGINE FAILED: " + ex);
+            _engineError = true;
+            try { if (_tray is not null) _tray.Text = L10n.Resolved is Lang.Zh or Lang.Hant ? "Vibe XASR · 引擎加载失败" : "Vibe XASR · engine failed"; } catch { }
+            UpdateTrayIcon();
+            _tray?.ShowBalloonTip(5000, "Vibe XASR",
+                "Model/engine failed: " + ex.Message, ToolTipIcon.Error);
+        }
+        finally { _engineSwapping = false; }
+    }
+
+    /// <summary>Build the ASR/VAD engine + worker (heavy model load). Background thread. No mic.</summary>
+    private void BuildEngineCore()
+    {
+        Diag.Log("engine: loading model…");
+        _engine = new DictationEngine(_settings) { Mode = _settings.Mode };
+        _engine.OnPartial += OnPartial;
+        _engine.OnFinal += OnFinal;
+        _engine.Start();
+        Diag.Log("engine: model loaded");
+    }
+
+    /// <summary>(Re)start the microphone on the chosen device. Must run on the UI thread.</summary>
+    private void StartMic()
+    {
+        if (_mic is not null) { _mic.FrameAvailable -= OnMicFrame; try { _mic.Dispose(); } catch { } _mic = null; }
+        try
+        {
+            _mic = new MicCapture(_settings.MicDeviceId);
+            _mic.FrameAvailable += OnMicFrame;
+            _mic.Start();
+        }
+        catch (Exception ex) { Diag.Log("mic start failed: " + ex.Message); }
+    }
+
+    private void StopEngine()
+    {
+        _engineReady = false;
+        if (_mic is not null) { _mic.FrameAvailable -= OnMicFrame; _mic.Dispose(); _mic = null; }
+        if (_engine is not null)
+        {
+            _engine.OnPartial -= OnPartial;
+            _engine.OnFinal -= OnFinal;
+            _engine.Dispose();
+            _engine = null;
+        }
+    }
+
+    /// <summary>
+    /// Diagnostic self-test: feed a speech WAV through the real engine as if it were a
+    /// push-to-talk hold, and log the partials/final. Confirms the ASR pipeline produces
+    /// text on Windows independent of the microphone. Triggered by VIBEXASR_OPEN=selftest:&lt;wav&gt;.
+    /// </summary>
+    private async Task SelfTestAsync(string? wavPath)
+    {
+        try
+        {
+            var paths = ModelPaths.ForTier(_settings.Tier);
+            Diag.Log($"selftest: asrPresent={paths.AsrModelPresent()} wav={wavPath} exists={File.Exists(wavPath ?? "")}");
+            if (!paths.AsrModelPresent() || string.IsNullOrEmpty(wavPath) || !File.Exists(wavPath)) return;
+
+            // Read + downmix + resample to 16 kHz mono float via NAudio.
+            var samples = new List<float>();
+            using (var rdr = new AudioFileReader(wavPath))
+            {
+                ISampleProvider sp = rdr;
+                if (sp.WaveFormat.Channels > 1) sp = sp.ToMono();
+                if (sp.WaveFormat.SampleRate != 16000) sp = new WdlResamplingSampleProvider(sp, 16000);
+                var buf = new float[16000];
+                int n;
+                while ((n = sp.Read(buf, 0, buf.Length)) > 0)
+                    for (int i = 0; i < n; i++) samples.Add(buf[i]);
+            }
+            float peak = 0; foreach (var s in samples) peak = Math.Max(peak, Math.Abs(s));
+            Diag.Log($"selftest: {samples.Count} samples ({samples.Count / 16000.0:F1}s) peak={peak:F3}");
+
+            // Drive a fresh DictationEngine (its own model, NO mic) through the real PTT path:
+            // BeginHold → push frames → EndHold. This exercises the exact code the hotkey uses
+            // (queue + PTT branch + InputFinished + OnFinal), with one clean audio source.
+            await Task.Run(() =>
+            {
+                using var eng = new DictationEngine(_settings) { Mode = DictationMode.Paste };
+                eng.OnPartial += (_, ev) => { };
+                eng.OnFinal += (_, ev) => Diag.Log($"selftest ENGINE OnFinal: len={ev.Text?.Length ?? 0} \"{ev.Text}\"");
+                eng.Start();
+                eng.BeginHold();
+                for (int i = 0; i < samples.Count; i += 512)
+                {
+                    int n = Math.Min(512, samples.Count - i);
+                    var f = new float[n];
+                    samples.CopyTo(i, f, 0, n);
+                    eng.PushFrame(f);
+                    Thread.Sleep(8);
+                }
+                Thread.Sleep(400);
+                eng.EndHold();
+                Thread.Sleep(1500); // let the worker finalize
+                Diag.Log("selftest: engine path done");
+            });
+        }
+        catch (Exception ex) { Diag.Log("selftest FAILED: " + ex); }
+    }
+
+    /// <summary>Once per launch, tell the user the app is live + how to use it (tray prompt),
+    /// since otherwise it just sits silently in the notification area.</summary>
+    private void AnnounceReady()
+    {
+        if (_announcedReady || _tray is null) return;
+        _announcedReady = true;
+
+        // First launch: the onboarding window is already open (shown in Start) and flips its own
+        // status to "ready", so don't also fire a balloon. Once the user has been through the
+        // guide (Welcomed == true), a lightweight tray prompt with the hotkey hint is enough.
+        if (!_settings.Welcomed) return;
+
+        var key = VkNames.Name(_settings.HotkeyVk);
+        bool zh = L10n.Resolved is Lang.Zh or Lang.Hant;
+        string title = zh ? "Vibe XASR 已就绪" : "Vibe XASR is ready";
+        string msg = _settings.Mode == DictationMode.OnCall
+            ? (zh ? "持续候机已开启 · 识别结果显示在右上角悬浮窗" : "OnCall is on · live text shows top-right")
+            : (zh ? $"按住 {key} 说话,松开即把文字落到光标处。" : $"Hold {key} and speak; release to drop the text.");
+        try { _tray.ShowBalloonTip(6000, title, msg, ToolTipIcon.Info); } catch { }
+    }
+
+    /// <summary>Show the first-run onboarding guide (also re-runnable from the tray menu).</summary>
+    private void ShowOnboarding()
+    {
+        RunOnUi(() =>
+        {
+            try
+            {
+                if (_onboarding is { IsDisposed: false }) { _onboarding.Activate(); _onboarding.BringToFront(); return; }
+                _onboarding = new OnboardingForm(this);
+                _onboarding.FormClosed += (_, _) => _onboarding = null;
+                _onboarding.Show();
+            }
+            catch (Exception ex) { Diag.Log("onboarding failed: " + ex); }
+        });
+    }
+
+    /// <summary>Reflect engine state in the tray tooltip (the Windows analog of the macOS
+    /// status-bar text): preparing → ready / OnCall. Surfaces the slower-than-macOS model load so
+    /// the tray isn't silent while the user waits.</summary>
+    private void UpdateTrayStatus()
+    {
+        if (_tray is null) return;
+        bool zh = L10n.Resolved is Lang.Zh or Lang.Hant;
+        string s;
+        if (!_engineReady)
+            s = zh ? "Vibe XASR · 正在准备识别引擎…" : "Vibe XASR · preparing engine…";
+        else if (_settings.Mode == DictationMode.OnCall)
+            s = zh ? "Vibe XASR · 持续候机中" : "Vibe XASR · OnCall active";
+        else
+            s = zh ? $"Vibe XASR · 就绪,按住 {VkNames.Name(_settings.HotkeyVk)} 说话"
+                   : $"Vibe XASR · ready — hold {VkNames.Name(_settings.HotkeyVk)}";
+        if (s.Length > 63) s = s.Substring(0, 63);
+        try { _tray.Text = s; } catch { }
+        UpdateTrayIcon();
+    }
+
+    /// <summary>Tint the tray icon by state (mirrors macOS's colored menu-bar bars):
+    /// red = recording, green = OnCall, orange = engine error, none = ready/loading.</summary>
+    private void UpdateTrayIcon()
+    {
+        if (_tray is null) return;
+        var st = _engineError ? Branding.TrayState.Error
+               : (_engineReady && _listening) ? Branding.TrayState.Recording
+               : (_engineReady && _settings.Mode == DictationMode.OnCall) ? Branding.TrayState.OnCall
+               : Branding.TrayState.Ready;
+        try { _tray.Icon = Branding.StateIcon(st); } catch { }
+    }
+
+    /// <summary>
+    /// Mic diagnostic: capture ~6 s from the real microphone, log device/format/level, save it
+    /// to %APPDATA%\VibeXASR\mictest.wav, and run the ASR on it — so we can see whether the
+    /// user's mic audio actually reaches + recognizes. Triggered by VIBEXASR_OPEN=mictest.
+    /// </summary>
+    // Runs entirely on a background thread (synchronous) so it can't stall on the startup
+    // sync-context. Captures the real mic for 6 s, logs level, saves a WAV, and runs the ASR.
+    private Task MicTestAsync() => Task.Run(() =>
+    {
+        try
+        {
+            var samples = new List<float>();
+            int frames = 0; float peak = 0;
+            var mic = new MicCapture();
+            mic.FrameAvailable += (_, f) =>
+            {
+                frames++;
+                lock (samples) samples.AddRange(f);
+                double s = 0; foreach (var v in f) s += v * v;
+                float rms = f.Length > 0 ? (float)Math.Sqrt(s / f.Length) : 0;
+                if (rms > peak) peak = rms;
+            };
+            mic.Start();
+            RunOnUi(() => _tray?.ShowBalloonTip(6500, "Vibe XASR",
+                L10n.Resolved is Lang.Zh or Lang.Hant ? "麦克风测试:请现在说话 6 秒…" : "Mic test: please speak for 6 seconds…",
+                ToolTipIcon.Info));
+            Diag.Log("mictest: recording 6s — SPEAK NOW");
+            Thread.Sleep(6000);
+
+            float[] arr; lock (samples) arr = samples.ToArray();
+            Diag.Log($"mictest: frames={frames} samples={arr.Length} ({arr.Length / 16000.0:F1}s) peakRMS={peak:F4}");
+            try { mic.Stop(); mic.Dispose(); } catch (Exception ex) { Diag.Log("mic stop/dispose: " + ex.Message); }
+
+            var wav = System.IO.Path.Combine(AppPaths.DataDir, "mictest.wav");
+            using (var w = new WaveFileWriter(wav, WaveFormat.CreateIeeeFloatWaveFormat(16000, 1)))
+                w.WriteSamples(arr, 0, arr.Length);
+            Diag.Log("mictest: saved " + wav);
+
+            using var asr = new StreamingAsr(ModelPaths.ForTier(_settings.Tier), 16000);
+            for (int i = 0; i < arr.Length; i += 1600)
+            {
+                int n = Math.Min(1600, arr.Length - i);
+                var f = new float[n]; Array.Copy(arr, i, f, 0, n);
+                asr.AcceptWaveform(f);
+            }
+            var text = asr.Finalize();
+            Diag.Log($"mictest ASR result: \"{text}\"");
+            RunOnUi(() => _tray?.ShowBalloonTip(8000, "Vibe XASR",
+                string.IsNullOrEmpty(text)
+                    ? (L10n.Resolved is Lang.Zh or Lang.Hant ? $"未识别到内容(峰值音量 {peak:F3})" : $"Nothing recognized (peak {peak:F3})")
+                    : (L10n.Resolved is Lang.Zh or Lang.Hant ? "识别到:" : "Recognized: ") + text,
+                ToolTipIcon.Info));
+        }
+        catch (Exception ex) { Diag.Log("mictest FAILED: " + ex); }
+    });
+
+    private void ShowDownloadDialog()
+        => RunOnUi(() =>
+        {
+            if (_dl is null)
+            {
+                _dl = new Ui.Wpf.DownloadWindow();
+                _dl.CancelRequested += () => _engineDlCts?.Cancel();
+            }
+            if (!_dl.IsVisible) _dl.Show();
+            _dl.Activate();
+        });
+
+    private void CloseDownloadDialog()
+        => RunOnUi(() => { _dl?.Hide(); });
+
+    // ---- mic → engine + level meter ----
+
+    private void OnMicFrame(object? sender, float[] frame)
+    {
+        if (_settings.MicMuted) { _overlay?.SetLevel(0); return; }   // tray quick mic-mute: drop capture, flatten the meter
+        _engine?.PushFrame(frame);
+        // Cheap RMS envelope to drive the overlay waveform.
+        double sum = 0;
+        for (int i = 0; i < frame.Length; i++) sum += frame[i] * frame[i];
+        double rms = frame.Length > 0 ? Math.Sqrt(sum / frame.Length) : 0;
+        if (rms > _holdPeakRms) _holdPeakRms = (float)rms;
+        _overlay?.SetLevel(Math.Min(1.0, rms * 6.0));
+    }
+
+    // ---- hotkey ----
+
+    // ---- trigger-mode state (macOS parity: 单击切换 pure-toggle + 按住说话 smart/hybrid) ----
+    private bool _toggleDictating;        // 单击切换: currently latched on?
+    private DateTime? _hybridPressAt;     // 按住说话(智能): when this press started (tap vs hold)
+    private bool _hybridLatched;          // a quick tap latched it (hands-free) → next press stops
+    private bool _hybridIgnoreUp;         // swallow the release of the "press-to-stop" tap
+    private const double TapThresholdSec = 0.35;   // ≤ this = a "tap" → latch; longer = a real hold
+
+    private void ResetTriggerState() { _toggleDictating = false; _hybridLatched = false; _hybridIgnoreUp = false; _hybridPressAt = null; }
+
+    private void OnHotkeyDown() => OnHotkeyFire(null, true);
+    private void OnHotkeyUp() => OnHotkeyFire(null, false);
+    private void OnTemplateHotkeyDown(string id) => OnHotkeyFire(id, true);
+    private void OnTemplateHotkeyUp(string id) => OnHotkeyFire(id, false);
+
+    /// <summary>Unified hotkey dispatch (port of macOS wireHotkeys/handleHybrid). id=null → main key,
+    /// id!=null → a per-template key (selects that template for this session).</summary>
+    private void OnHotkeyFire(string? id, bool isDown)
+    {
+        Diag.Log($"OnHotkeyFire id={id ?? "(main)"} down={isDown} trigger={_settings.Trigger} listening={_listening} latched={_hybridLatched}");
+        if (_settings.Trigger == TriggerMode.Toggle)
+        {
+            // 单击切换: act only on press. 1st press → start, 2nd press → stop.
+            if (!isDown) return;
+            if (_toggleDictating) { _toggleDictating = false; StopDictation(); }
+            else { ApplySessionTemplate(id); _toggleDictating = StartDictation(); }
+            return;
+        }
+        // 按住说话 (smart/hybrid, default): hold = push-to-talk (release stops);
+        // quick tap = latch (hands-free); when latched, the next press stops.
+        if (isDown)
+        {
+            if (_hybridLatched) { _hybridLatched = false; _hybridIgnoreUp = true; StopDictation(); }
+            else { ApplySessionTemplate(id); _hybridPressAt = StartDictation() ? DateTime.UtcNow : (DateTime?)null; }
+        }
+        else
+        {
+            if (_hybridIgnoreUp) { _hybridIgnoreUp = false; return; }
+            if (_hybridPressAt is not { } downAt) return;
+            _hybridPressAt = null;
+            if ((DateTime.UtcNow - downAt).TotalSeconds < TapThresholdSec) _hybridLatched = true;  // tap → latch
+            else StopDictation();                                                                  // hold → stop on release
+        }
+    }
+
+    /// <summary>A per-template hotkey selects its template for the upcoming utterance (id=null = leave as-is).</summary>
+    private void ApplySessionTemplate(string? id)
+    {
+        if (string.IsNullOrEmpty(id)) return;
+        _settings.CloudActiveTemplate = id;
+        _settings.Save();
+        ConfigureRefiner();
+        _popup?.Invalidate();
+    }
+
+    /// <summary>Begin capturing. Returns true if it actually started (so toggle/hybrid state stays correct
+    /// when it can't, e.g. engine still loading).</summary>
+    private bool StartDictation()
+    {
+        Diag.Log($"StartDictation enabled={_dictationEnabled} mode={_settings.Mode} ready={_engineReady} trigger={_settings.Trigger}");
+        if (!_dictationEnabled)
+        {
+            _tray?.ShowBalloonTip(2500, "Vibe XASR",
+                L10n.Resolved is Lang.Zh or Lang.Hant ? "听写已停用(在菜单里启用)" : "Dictation is disabled (enable it in the menu).",
+                ToolTipIcon.Info);
+            return false;
+        }
+        if (_settings.Mode == DictationMode.OnCall) return false; // OnCall is always-on; PTT n/a
+        if (!_engineReady)
+        {
+            _tray?.ShowBalloonTip(2500, "Vibe XASR",
+                L10n.Resolved is Lang.Zh or Lang.Hant ? "模型正在加载,请稍候…" : "Model is still loading, please wait…",
+                ToolTipIcon.Info);
+            return false;
+        }
+        if (_listening) return true;
+        _typedSoFar = string.Empty;
+        _holdPeakRms = 0;
+        _listening = true;
+        UpdateTrayIcon();
+        _engine?.BeginHold();
+        _overlay?.ShowListening();
+        if (_settings.CueEnabled) CueSound.Shared.Play(_settings.CueTheme, start: true);   // 提示音: start chime
+        return true;
+    }
+
+    private void StopDictation()
+    {
+        if (_settings.Mode == DictationMode.OnCall) return;
+        _toggleDictating = false; _hybridLatched = false; _hybridPressAt = null;   // clear latch state on any stop
+        if (!_listening) return;
+        _listening = false;
+        UpdateTrayIcon();
+        Diag.Log($"StopDictation; peak mic RMS={_holdPeakRms:F4}");
+        _engine?.EndHold();
+        if (_settings.CueEnabled) CueSound.Shared.Play(_settings.CueTheme, start: false);  // 提示音: stop chime
+    }
+
+    // ---- engine events (raised on the engine worker thread) ----
+
+    private void OnPartial(object? sender, PartialEventArgs e)
+    {
+        switch (_settings.Mode)
+        {
+            case DictationMode.Paste:
+            case DictationMode.OnCall:
+                _overlay?.SetText(e.Text);
+                break;
+            case DictationMode.Type:
+                StreamTypeDiff(ApplyCorrections(e.Text, isFinal: false));  // type pinyin/replacements live; no final-only retype
+                _overlay?.SetText(e.Text);
+                break;
+        }
+        if (_popup is { IsVisible: true }) RunOnUi(() => _popup?.Invalidate());
+    }
+
+    private void OnFinal(object? sender, FinalEventArgs e)
+    {
+        Diag.Log($"OnFinal mode={_settings.Mode} len={e.Text?.Length ?? 0} text=\"{Trunc(e.Text)}\"");
+
+        // Empty final = end-of-hold with nothing recognized: just close the overlay (PTT),
+        // don't insert/record. (Without this the overlay would stay up after release.)
+        if (string.IsNullOrEmpty(e.Text))
+        {
+            if (_settings.Mode != DictationMode.OnCall) _overlay?.HideOverlay();
+            return;
+        }
+
+        // 词典 post-processing: homophone (pinyin) correction → text replacements, before insert.
+        var text = MaybeTraditional(ApplyCorrections(e.Text));
+
+        // AI 润色 (Beta): cloud-refine the final text before insert — Paste mode only (Type streams
+        // live; OnCall is a session log). Async + HUD; any failure/timeout falls back to `text`.
+        if (Refiner.Active && _settings.Mode == DictationMode.Paste)
+        {
+            // Feed the cloud the text WITHOUT local 数字规整/去口水 (cloud handles them) so its 改口
+            // edits aren't rejected by the digit guardrail. Pinyin/replacements/口令 still apply.
+            var cloudIn = ApplyCorrections(e.Text, isFinal: true, forCloud: true);
+            _ = RefineAndInsertAsync(e.Text, cloudIn);
+            return;
+        }
+
+        var modeTag = _settings.Mode.ToString().ToLowerInvariant();
+        _history.Append(text, modeTag, ephemeral: !_settings.HistoryEnabled);
+
+        switch (_settings.Mode)
+        {
+            case DictationMode.Paste:
+                TextInserter.InsertText(text);
+                MaybeOverwriteClipboard(text);
+                _lastInsertText = text; _lastRawText = e.Text;
+                _overlay?.SetText(text);     // so the "已插入 · N 字" count reflects the inserted text
+                _overlay?.ShowInserted(withUndo: true);
+                break;
+            case DictationMode.Type:
+                // 逐字: converge to the streaming-level text (no tail rewrite); history + clipboard keep the full correction.
+                StreamTypeDiff(ApplyCorrections(e.Text, isFinal: false));
+                _lastInsertText = _typedSoFar; _lastRawText = e.Text;   // actual on-screen text (post-繁体)
+                _typedSoFar = string.Empty;
+                MaybeOverwriteClipboard(text);
+                _overlay?.SetText(text);
+                _overlay?.ShowInserted(withUndo: true);
+                break;
+            case DictationMode.OnCall:
+                lock (_onCallSession)
+                    _onCallSession.Add(new HistoryEntry { Text = text.Trim(), Mode = "oncall", Timestamp = DateTimeOffset.Now });
+                RefreshOnCallSession();
+                _overlay?.SetText(text);
+                break;
+        }
+        RefreshOpenWindows();
+    }
+
+    /// <summary>Cloud-refine the final text (Beta), then insert. Paste mode only. Shows the 润色中 HUD;
+    /// any error/timeout/guardrail-reject falls back to the rule-version text (never drops text).</summary>
+    private async Task RefineAndInsertAsync(string rawAsr, string ruleText)
+    {
+        CloudRequestLog.Shared.PendingOriginal = rawAsr;   // log input = raw ASR (no rules)
+        _overlay?.ShowRefining();
+        string finalText;
+        try { finalText = await Refiner.PolishAsync(ruleText); }
+        catch (Exception ex) { Diag.Log("refine failed: " + ex.Message); finalText = ruleText; }
+        finalText = MaybeTraditional(finalText);   // 输出转繁体 (applied after cloud polish)
+        RunOnUi(() =>
+        {
+            _history.Append(finalText, "paste", ephemeral: !_settings.HistoryEnabled);
+            TextInserter.InsertText(finalText);
+            MaybeOverwriteClipboard(finalText);
+            _lastInsertText = finalText; _lastRawText = rawAsr;
+            _overlay?.SetRepolishTemplates(RepolishTemplateList());
+            _overlay?.SetText(finalText);
+            _overlay?.ShowInserted(withUndo: true, withRepolish: true);
+            RefreshOpenWindows();
+        });
+    }
+
+    /// <summary>撤销: delete the just-inserted text (backspace its length) and dismiss the HUD.</summary>
+    private void UndoLastInsert()
+    {
+        if (string.IsNullOrEmpty(_lastInsertText)) { _overlay?.HideOverlay(); return; }
+        Input.TextInserter.Backspace(_lastInsertText.Length);
+        _lastInsertText = string.Empty;
+        _overlay?.HideOverlay();
+    }
+
+    /// <summary>The templates offered by the HUD 换模板重润色 picker: ⚡自动 + saved templates.</summary>
+    private List<(string id, string name)> RepolishTemplateList()
+    {
+        var list = new List<(string, string)> { ("auto", "⚡ " + L10n.T("popup.template.auto")) };
+        foreach (var t in CloudJson.Templates(_settings.CloudTemplatesJson))
+            list.Add((t.Id, string.IsNullOrEmpty(t.Name) ? t.Id : t.Name));
+        return list;
+    }
+
+    /// <summary>换模板重润色: re-run cloud 润色 on the SAME original ASR text with the CHOSEN template,
+    /// then replace the inserted text. The user picks the template from the HUD menu (macOS parity).</summary>
+    private async void RepolishLast(string templateId)
+    {
+        if (string.IsNullOrEmpty(_lastRawText) || !Refiner.Active) return;
+
+        _settings.CloudActiveTemplate = string.IsNullOrEmpty(templateId) ? "auto" : templateId;
+        _settings.Save(); ConfigureRefiner();   // BuildCloudSystem now uses the chosen template's prompt
+        _popup?.Invalidate();
+
+        if (_lastInsertText.Length > 0) Input.TextInserter.Backspace(_lastInsertText.Length);
+        _overlay?.ShowRefining();
+
+        // feed the cloud the ORIGINAL raw ASR (context) routed through the chosen template's prompt
+        var ruleText = ApplyCorrections(_lastRawText, isFinal: true, forCloud: true);
+        CloudRequestLog.Shared.PendingOriginal = _lastRawText;
+        string outText;
+        try { outText = await Refiner.PolishAsync(ruleText); }
+        catch (Exception ex) { Diag.Log("re-polish failed: " + ex.Message); outText = ruleText; }
+        outText = MaybeTraditional(outText);
+        RunOnUi(() =>
+        {
+            _history.Append(outText, "paste", ephemeral: !_settings.HistoryEnabled);
+            Input.TextInserter.InsertText(outText);
+            MaybeOverwriteClipboard(outText);
+            _lastInsertText = outText;
+            _overlay?.SetRepolishTemplates(RepolishTemplateList());
+            _overlay?.SetText(outText);
+            _overlay?.ShowInserted(withUndo: true, withRepolish: true);
+            RefreshOpenWindows();
+        });
+    }
+
+    /// <summary>(Re)configure the AI refiner from settings: cloud backend when enabled + key/url/model
+    /// present, else off. Called on launch and whenever the 润色 settings change. No engine rebuild.</summary>
+    private void ConfigureRefiner()
+    {
+        CloudRequestLog.Shared.Enabled = _settings.CloudLogEnabled;
+        if (_settings.CloudEnabled && !string.IsNullOrWhiteSpace(_settings.CloudApiKey)
+            && !string.IsNullOrWhiteSpace(_settings.CloudBaseURL) && !string.IsNullOrWhiteSpace(_settings.CloudModel))
+        {
+            Refiner.Backend = new CloudRefiner(_settings.CloudBaseURL, _settings.CloudModel, _settings.CloudApiKey,
+                _settings.CloudTemperature, _settings.CloudMaxTokens, _settings.CloudProvider);
+            Refiner.TimeoutSeconds = 25;
+            Refiner.SystemProvider = BuildCloudSystem;
+            Diag.Log($"refiner: cloud ready provider={_settings.CloudProvider} model={_settings.CloudModel}");
+        }
+        else Refiner.Backend = null;
+    }
+
+    /// <summary>Cloud system prompt from the 4 toggles, with {{hotwords}}/{{date}} filled; {{transcript}}
+    /// is left for the backend (filled at refine time).</summary>
+    private string BuildCloudSystem()
+    {
+        var active = string.IsNullOrEmpty(_settings.CloudActiveTemplate) ? "auto" : _settings.CloudActiveTemplate;
+        string sys;
+        if (active == "auto")
+        {
+            sys = string.IsNullOrEmpty(_settings.CloudAutoOverride)
+                ? CloudPrompt.BuildAuto(_settings.CloudNumbers, _settings.CloudFillers, _settings.CloudRestate, _settings.CloudHotwords)
+                : _settings.CloudAutoOverride;
+        }
+        else
+        {
+            var t = CloudJson.Templates(_settings.CloudTemplatesJson).FirstOrDefault(x => x.Id == active);
+            sys = t is not null && !string.IsNullOrWhiteSpace(t.Content)
+                ? t.Content
+                : CloudPrompt.BuildAuto(_settings.CloudNumbers, _settings.CloudFillers, _settings.CloudRestate, _settings.CloudHotwords);
+        }
+        var hotwords = _settings.HotwordsEnabled ? _settings.HotwordsText.Replace("\n", "、") : "";
+        return CloudPrompt.FillStatic(sys, hotwords, DateTime.Now.ToString("yyyy-MM-dd"));
+    }
+
+    /// <summary>Apply changed 润色 settings: persist + reconfigure the backend. (IAppController)</summary>
+    public void ApplyCloudSettings() { _settings.Save(); ConfigureRefiner(); RefreshTemplateHotkeys(); }
+
+    /// <summary>Apply the post-processors to a final result, matching the macOS pipeline order:
+    /// pinyin homophone correction → text replacements → 去口水词 → 数字规整 (ITN) → 口令 expansion.
+    /// Each step no-ops unless enabled + populated. Runs on FINAL text only (not streaming partials,
+    /// where ITN digits would jump as you speak).</summary>
+    private string ApplyCorrections(string textIn, bool isFinal = true, bool forCloud = false)
+    {
+        var text = textIn;
+        if (_settings.PinyinFuzzyEnabled && _pinyin.IsActive) text = _pinyin.Normalize(text);
+        if (_settings.ReplacementsEnabled && _replaceRules.Count > 0) text = Replacements.Apply(text, _replaceRules);
+        // FINAL-only steps. In 逐字 (type) mode they're skipped for what's typed live — applying them
+        // on the final would delete + retype the on-screen tail (jarring). They still run for the
+        // recorded history + clipboard text. (Mirrors macOS's corrected(isFinal:) split.)
+        if (!isFinal) return text;
+        // When the text is bound for cloud 润色, SKIP local 去口水/数字规整 — the cloud does both
+        // ("已由 AI 润色接管"). Running them first injects digits/edits that the cloud's 改口 then
+        // removes, which trips the digit/shrink guardrail → the polish is rejected and the raw text
+        // is inserted instead (the 「八点…不对九点 → 8:00 没被改口」 bug).
+        if (!forCloud && _settings.DefillerEnabled) text = Defiller.Clean(text);     // 去口水词: strip fillers first
+        if (!forCloud && _settings.ItnEnabled) text = ChineseITN.Normalize(text);    // 数字规整: then normalize numbers
+        if (_settings.SnippetsEnabled && _snippetRules.Count > 0) text = Replacements.Expand(text, _snippetRules); // 口令: expand last
+        return text;
+    }
+
+    /// <summary>(Re)load the homophone table + dictionary words + replacement rules from settings.
+    /// Called on launch and whenever the 词典 settings change (no engine rebuild needed for these).</summary>
+    private void RefreshCorrections()
+    {
+        try
+        {
+            _pinyin.LoadTableIfNeeded(ModelPaths.ForTier(_settings.Tier).PinyinTable);
+            _pinyin.SetWords(_settings.PinyinFuzzyEnabled ? HotwordsStore.Normalize(_settings.HotwordsText) : new List<string>());
+            _replaceRules = _settings.ReplacementsEnabled ? Replacements.Parse(_settings.ReplacementsText) : Array.Empty<Replacements.Rule>();
+            _snippetRules = _settings.SnippetsEnabled ? ParseSnippets(_settings.SnippetsJson) : Array.Empty<Replacements.Rule>();
+            Diag.Log($"corrections: pinyin={_pinyin.IsActive} rules={_replaceRules.Count} snippets={_snippetRules.Count} itn={_settings.ItnEnabled} defiller={_settings.DefillerEnabled}");
+        }
+        catch (Exception ex) { Diag.Log("RefreshCorrections failed: " + ex.Message); }
+    }
+
+    /// <summary>Parse snippets JSON (<c>[{"t":trigger,"x":text}]</c>) into expansion rules.</summary>
+    private static IReadOnlyList<Replacements.Rule> ParseSnippets(string? json)
+    {
+        var rules = new List<Replacements.Rule>();
+        if (string.IsNullOrWhiteSpace(json)) return rules;
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            if (doc.RootElement.ValueKind != JsonValueKind.Array) return rules;
+            foreach (var el in doc.RootElement.EnumerateArray())
+            {
+                if (el.ValueKind != JsonValueKind.Object) continue;
+                var t = el.TryGetProperty("t", out var tv) ? tv.GetString() : null;
+                var x = el.TryGetProperty("x", out var xv) ? xv.GetString() : null;
+                if (!string.IsNullOrEmpty(t)) rules.Add(new Replacements.Rule(t, x ?? ""));
+            }
+        }
+        catch (Exception ex) { Diag.Log("ParseSnippets failed: " + ex.Message); }
+        return rules;
+    }
+
+    /// <summary>Hidden 词典 self-test (VIBEXASR_OPEN=dicttest): exercises the hotwords-file writer,
+    /// the pinyin homophone normalizer, and the replacement engine on sample text → log.txt.</summary>
+    private void RunDictTest()
+    {
+        var paths = ModelPaths.ForTier(_settings.Tier);
+        try
+        {
+            HotwordsStore.WriteFile("贾扬清\n沈向洋\nOpenAI\nPyTorch", 5.0, paths.HotwordsFile);
+            Diag.Log("dicttest hotwords.txt:\n" + (File.Exists(paths.HotwordsFile) ? File.ReadAllText(paths.HotwordsFile) : "(none)"));
+
+            var pn = new PinyinNormalizer();
+            pn.LoadTableIfNeeded(paths.PinyinTable);
+            pn.SetWords(new[] { "贾扬清", "沈向洋" });
+            Diag.Log($"dicttest pinyin active={pn.IsActive}");
+            foreach (var t in new[] { "贾阳清", "嘉阳青", "沈向阳", "你好世界" })
+                Diag.Log($"  pinyin '{t}' -> '{pn.Normalize(t)}'");
+
+            var rules = Replacements.Parse("open claw => OpenClaw\n李牧 => 李沐");
+            foreach (var t in new[] { "我用 open claw 框架", "李牧老师", "OPEN CLAW yes" })
+                Diag.Log($"  replace '{t}' -> '{Replacements.Apply(t, rules)}'");
+
+            // 数字规整 (ITN)
+            foreach (var t in new[] { "一百二十三", "二零二四年", "三点半", "百分之二十五", "五千八百块",
+                                      "端口八零八零", "下午三点一刻", "第一个人", "等一下", "一带一路" })
+                Diag.Log($"  itn '{t}' -> '{ChineseITN.Normalize(t)}'");
+
+            // 去口水词 (defiller)
+            foreach (var t in new[] { "嗯这个就是就是我的想法", "那个那个我们看看", "呃我我我觉得", "好好学习" })
+                Diag.Log($"  defiller '{t}' -> '{Defiller.Clean(t)}'");
+
+            // 口令 (snippets): trigger tolerates spaced letters + eats one trailing sentence mark
+            var snips = ParseSnippets("[{\"t\":\"我的邮箱\",\"x\":\"tao@example.com\"},{\"t\":\"cc\",\"x\":\"抄送\"}]");
+            foreach (var t in new[] { "请发到我的邮箱。", "麻烦 C C 一下", "我的邮箱" })
+                Diag.Log($"  snippet '{t}' -> '{Replacements.Expand(t, snips)}'");
+
+            // 提示音 (cue) — verify synthesis + playback path doesn't throw (covers sine + FM timbres)
+            CueSound.Shared.SetVolume("med");
+            CueSound.Shared.Play("chime", start: true);
+            CueSound.Shared.Play("marimba", start: false);
+            Diag.Log("  cue: chime/marimba rendered + played ok");
+            Diag.Log("dicttest done");
+        }
+        catch (Exception ex) { Diag.Log("dicttest error: " + ex); }
+    }
+
+    private void MaybeOverwriteClipboard(string text)
+    {
+        if (!_settings.ClipboardOverwrite || string.IsNullOrEmpty(text)) return;
+        RunOnUi(() => { try { Clipboard.SetText(text); } catch { } });
+    }
+
+    /// <summary>Type-mode incremental insertion: keep the common prefix, backspace the
+    /// divergent tail, type the new suffix (mirrors the macOS streaming inserter).</summary>
+    private void StreamTypeDiff(string newText)
+    {
+        newText = MaybeTraditional(newText);   // 输出转繁体 (1:1 char map → safe mid-stream diff)
+        int common = 0, max = Math.Min(_typedSoFar.Length, newText.Length);
+        while (common < max && _typedSoFar[common] == newText[common]) common++;
+        int toDelete = _typedSoFar.Length - common;
+        if (toDelete > 0) TextInserter.Backspace(toDelete);
+        var suffix = newText[common..];
+        if (suffix.Length > 0) TextInserter.InsertText(suffix);
+        _typedSoFar = newText;
+    }
+
+    /// <summary>Apply 输出转繁体 (简→繁) when enabled, at the very end of the pipeline.</summary>
+    private string MaybeTraditional(string text) => _settings.OutputTraditional ? Lexicon.Hant.ToTraditional(text) : text;
+
+    // ---- IAppController ----
+
+    public Settings Settings => _settings;
+    public HistoryStore History => _history;
+    public ModelManager Models => _models;
+    public bool EngineSwapping => _engineSwapping;
+    public bool EngineReady => _engineReady;
+    public bool IsListening => _listening || _settings.Mode == DictationMode.OnCall;
+    public string CurrentOverlayText => _overlay?.CurrentText ?? string.Empty;
+
+    public bool DictationEnabled
+    {
+        get => _dictationEnabled;
+        set
+        {
+            _dictationEnabled = value;
+            if (!value && _settings.Mode == DictationMode.OnCall) SetMode(DictationMode.Paste);
+            _popup?.Invalidate();
+        }
+    }
+
+    public void SetMode(DictationMode mode)
+    {
+        if (_settings.Mode == mode) return;
+        bool wasOnCall = _settings.Mode == DictationMode.OnCall;
+        _settings.Mode = mode;
+        _settings.Save();
+        ResetTriggerState();   // don't carry a stale toggle/latch across a mode switch
+        if (_engine is not null) _engine.Mode = mode;
+
+        if (wasOnCall && mode != DictationMode.OnCall) _overlay?.LeaveOnCall();
+        if (mode == DictationMode.OnCall) EnterOnCall();
+
+        NotifyExternallyChanged();
+    }
+
+    private void EnterOnCall()
+    {
+        if (_engine is not null) _engine.Mode = DictationMode.OnCall;
+        lock (_onCallSession) _onCallSession.Clear();   // fresh session log (macOS clears on start)
+        RefreshOnCallSession();
+        _overlay?.ShowOnCall();
+        _overlay?.SetText(string.Empty);
+    }
+
+    private void TogglePause()
+    {
+        if (_engine is not null) _engine.Paused = !_engine.Paused;
+    }
+
+    public void SetVad(VadKind vad)
+    {
+        if (_settings.Vad == vad) return;
+        _settings.Vad = vad; _settings.Save();
+        _ = EnsureEngineAsync(swapping: true);
+    }
+
+    public void SetModelSource(string code)
+    {
+        _settings.ModelSource = code; _settings.Save();
+        Diag.Log("model source → " + code);
+    }
+
+    public void SelectTier(ModelTier tier)
+    {
+        if (_settings.Tier == tier && _engineReady) return;
+        _tierBeforeSwap = _settings.Tier;   // remember so a cancelled download can revert
+        _settings.Tier = tier; _settings.Save();
+        _ = EnsureEngineAsync(swapping: true);
+    }
+
+    public void SetHotkey(int vk, int mods)
+    {
+        _settings.HotkeyVk = vk; _settings.HotkeyMods = mods; _settings.Save();
+        _hotkey?.SetKey(vk, mods);
+    }
+
+    /// <summary>Re-read the per-template hotkey bindings (Prompt Studio) into the global hook.</summary>
+    private void RefreshTemplateHotkeys()
+        => _hotkey?.SetTemplateBindings(CloudTemplateHotkeys.Parse(_settings.CloudTemplateHotkeysJson));
+
+    public void SetLanguage(Lang lang)
+    {
+        L10n.Current = lang;
+        _settings.Language = L10n.ToCode(lang);
+        _settings.Save();
+        _popup?.Invalidate();
+        // Relocalize imperative chrome (build 205 parity): the tray context menu + open window titles
+        // are set once (not data-bound), so refresh them by hand on a language switch.
+        RunOnUi(() =>
+        {
+            if (_tray?.ContextMenuStrip is { } cm) RebuildTrayMenu(cm);
+            if (_settingsWpf is { } sw) sw.Title = L10n.T("win.settings");
+            if (_historyWpf is { } hw) hw.Title = "Vibe XASR · " + L10n.T("history.title");
+            if (_promptStudio is { } ps) ps.Title = L10n.T("studio.window");
+        });
+    }
+
+    public void SetClipboardOverwrite(bool on) { _settings.ClipboardOverwrite = on; _settings.Save(); }
+    public void SetHistoryEnabled(bool on) { _settings.HistoryEnabled = on; _settings.Save(); }
+
+    // ---- macOS build 204 parity ----
+    public void SetHudStay(double seconds) { _settings.HudStaySeconds = Math.Max(0, seconds); _settings.Save(); _overlay?.SetStaySeconds(_settings.HudStaySeconds); }
+    public void SetOutputTraditional(bool on) { _settings.OutputTraditional = on; _settings.Save(); }
+    public void SetTrigger(TriggerMode mode) { _settings.Trigger = mode; _settings.Save(); ResetTriggerState(); if (_listening) StopDictation(); }
+    public void SetMicMuted(bool on)
+    {
+        _settings.MicMuted = on; _settings.Save();
+        if (on) _overlay?.SetLevel(0);
+        _popup?.Invalidate();
+    }
+    public void SetActiveTemplate(string id)
+    {
+        _settings.CloudActiveTemplate = string.IsNullOrEmpty(id) ? "auto" : id;
+        _settings.Save();
+        ApplyCloudSettings();   // reconfigure the refiner with the newly-selected prompt
+        _popup?.Invalidate();
+    }
+
+    // ---- 词典 (dictionary) ----
+    public void SetHotwords(bool enabled, string text, double score)
+    {
+        _settings.HotwordsEnabled = enabled;
+        _settings.HotwordsText = text ?? "";
+        _settings.HotwordsScore = score;
+        _settings.Save();
+        RefreshCorrections();                  // pinyin words are derived from the hotwords list
+        _ = EnsureEngineAsync(swapping: true);  // rebuild so sherpa picks up the new biasing
+    }
+
+    public void SetReplacements(bool enabled, string text)
+    {
+        _settings.ReplacementsEnabled = enabled;
+        _settings.ReplacementsText = text ?? "";
+        _settings.Save();
+        RefreshCorrections();                   // live; no engine rebuild
+    }
+
+    public void SetPinyinFuzzy(bool on)
+    {
+        _settings.PinyinFuzzyEnabled = on;
+        _settings.Save();
+        RefreshCorrections();                   // live; no engine rebuild
+    }
+
+    public void SetItn(bool on)
+    {
+        _settings.ItnEnabled = on;
+        _settings.Save();                       // live; read directly in ApplyCorrections
+    }
+
+    public void SetDefiller(bool on)
+    {
+        _settings.DefillerEnabled = on;
+        _settings.Save();                       // live
+    }
+
+    public void SetSnippets(bool enabled, string json)
+    {
+        _settings.SnippetsEnabled = enabled;
+        _settings.SnippetsJson = json ?? "[]";
+        _settings.Save();
+        RefreshCorrections();                   // re-parse 口令 rules; no engine rebuild
+    }
+
+    // ---- 提示音 (cue sound) — changes preview the sound so the user hears them ----
+    public void SetCueEnabled(bool on)
+    {
+        _settings.CueEnabled = on;
+        _settings.Save();
+        if (on) CueSound.Shared.Play(_settings.CueTheme, start: true);
+    }
+
+    public void SetCueTheme(string theme)
+    {
+        _settings.CueTheme = string.IsNullOrEmpty(theme) ? "chime" : theme;
+        _settings.Save();
+        if (_settings.CueEnabled) CueSound.Shared.Play(_settings.CueTheme, start: true);
+    }
+
+    public void SetCueVolume(string preset)
+    {
+        _settings.CueVolume = string.IsNullOrEmpty(preset) ? "low" : preset;
+        _settings.Save();
+        CueSound.Shared.SetVolume(_settings.CueVolume);
+        if (_settings.CueEnabled) CueSound.Shared.Play(_settings.CueTheme, start: true);
+    }
+
+    // ---- 共享 (local share API) ----
+    public bool ApiRunning => _api?.IsRunning ?? false;
+    public int ApiBoundPort => _api?.BoundPort ?? 0;
+    public string ApiKey => _settings.ApiKey;
+
+    public void SetApiEnabled(bool on)
+    {
+        _settings.ApiEnabled = on; _settings.Save();
+        _api?.Restart(on, _settings.ApiPort, _settings.ApiAllowLAN);
+    }
+    public void SetApiAllowLAN(bool on)
+    {
+        _settings.ApiAllowLAN = on; _settings.Save();
+        _api?.Restart(_settings.ApiEnabled, _settings.ApiPort, on);
+    }
+    public void SetApiPort(int port)
+    {
+        _settings.ApiPort = port; _settings.Save();
+        _api?.Restart(_settings.ApiEnabled, port, _settings.ApiAllowLAN);
+    }
+    public string RegenerateApiKey()
+    {
+        var k = _settings.RegenerateApiKey();
+        _api?.Restart(_settings.ApiEnabled, _settings.ApiPort, _settings.ApiAllowLAN);   // pick up the new key
+        return k;
+    }
+
+    public void SetLaunchAtLogin(bool on)
+    {
+        _settings.LaunchAtLogin = on; _settings.Save();
+        try
+        {
+            using var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(
+                @"Software\Microsoft\Windows\CurrentVersion\Run", writable: true);
+            if (key is null) return;
+            if (on) key.SetValue("VibeXASR", $"\"{Application.ExecutablePath}\"");
+            else key.DeleteValue("VibeXASR", throwOnMissingValue: false);
+        }
+        catch { /* registry locked — non-fatal */ }
+    }
+
+    public bool MicGranted()
+    {
+        try
+        {
+            using var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(
+                @"Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\microphone");
+            // "Deny" => blocked globally. Missing/"Allow" => permitted.
+            return key?.GetValue("Value") as string != "Deny";
+        }
+        catch { return true; }
+    }
+
+    public void OpenMicPrivacy()
+    {
+        try { Process.Start(new ProcessStartInfo("ms-settings:privacy-microphone") { UseShellExecute = true }); }
+        catch { }
+    }
+
+    public System.Collections.Generic.List<(string Id, string Name)> MicDevices() => MicCapture.Devices();
+    public string MicDeviceId => _settings.MicDeviceId;
+
+    public void SetMicDevice(string id)
+    {
+        if (_settings.MicDeviceId == id) return;
+        _settings.MicDeviceId = id;
+        _settings.Save();
+        Diag.Log($"SetMicDevice -> {id}");
+        if (_engineReady) RunOnUi(StartMic); // hot-swap the mic only (no model reload)
+    }
+
+    public void OpenSettings() => OpenSettings(null);
+
+    private void OpenSettings(string? tab)
+    {
+        RunOnUi(() =>
+        {
+            // Redesigned WPF Settings window (drop-in for the old WinForms SettingsForm),
+            // shown modeless on the WinForms UI thread — WPF hooks the existing message pump.
+            if (_settingsWpf is not null)
+            {
+                if (tab is not null) _settingsWpf.ShowTab(tab);
+                _settingsWpf.Activate();
+                return;
+            }
+            var w = new Ui.Wpf.SettingsWindow(this);
+            w.Closed += (_, _) => _settingsWpf = null;
+            _settingsWpf = w;
+            if (tab is not null) w.ShowTab(tab);
+            w.Show();
+            w.Activate();
+        });
+    }
+
+    // ----- desktop floating launcher -----
+    private void ShowLauncher() => RunOnUi(() =>
+    {
+        if (_launcher is not null) { _launcher.Show(); return; }
+        _launcher = new Ui.Wpf.LauncherWindow(this);
+        _launcher.Closed += (_, _) => _launcher = null;
+        _launcher.Show();
+    });
+
+    public void SetLauncherEnabled(bool on)
+    {
+        _settings.LauncherEnabled = on; _settings.Save();
+        if (on) ShowLauncher();
+        else RunOnUi(() => { _launcher?.Close(); _launcher = null; });
+    }
+
+    /// <summary>Launcher click → show the tray quick-menu near the given screen point.</summary>
+    public void ShowQuickMenu(double screenX, double screenY) => RunOnUi(() =>
+    {
+        _popup ??= new Ui.Wpf.TrayPopupWindow(this);
+        _popup.ShowAt(screenX, screenY);
+    });
+
+    // 记录 is no longer a standalone window (macOS parity) — it's the Settings 记录 tab.
+    public void OpenHistory() => OpenSettings("history");
+
+    private Ui.Wpf.PromptStudioWindow? _promptStudio;
+    public void OpenPromptStudio()
+    {
+        RunOnUi(() =>
+        {
+            if (_promptStudio is not null) { _promptStudio.Activate(); return; }
+            var w = new Ui.Wpf.PromptStudioWindow(this);
+            w.Closed += (_, _) => _promptStudio = null;
+            _promptStudio = w;
+            w.Show();
+            w.Activate();
+        });
+    }
+
+    /// <summary>Open the CURRENT OnCall session transcript (the overlay "View" button) — the
+    /// ephemeral per-session records, NOT the global history (macOS OnCallSessionView parity).</summary>
+    public void OpenOnCallSession()
+    {
+        RunOnUi(() =>
+        {
+            if (_onCallSessionForm is { IsDisposed: false })
+            { _onCallSessionForm.Reload(); _onCallSessionForm.Activate(); _onCallSessionForm.BringToFront(); return; }
+            _onCallSessionForm = new OnCallSessionForm(SnapshotOnCallSession) { Icon = Branding.AppIcon };
+            _onCallSessionForm.Show();
+            _onCallSessionForm.Activate();
+            _onCallSessionForm.BringToFront();
+        });
+    }
+
+    private IReadOnlyList<HistoryEntry> SnapshotOnCallSession()
+    {
+        lock (_onCallSession) return _onCallSession.ToList();
+    }
+
+    private void RefreshOnCallSession()
+    {
+        if (_onCallSessionForm is { IsDisposed: false }) RunOnUi(() => _onCallSessionForm?.Reload());
+    }
+
+    private string OnCallSessionText()
+    {
+        lock (_onCallSession)
+            return string.Join(Environment.NewLine,
+                _onCallSession.Select(e => $"[{e.Timestamp.LocalDateTime:yyyy-MM-dd HH:mm:ss}] {e.Text}"));
+    }
+
+    public void Quit()
+    {
+        Dispose();
+        Application.ExitThread();
+    }
+
+    // ---- helpers ----
+
+    private void CopyOverlayText()
+    {
+        // OnCall: copy the WHOLE current session (timestamped), like macOS. PTT: copy the current
+        // overlay text, falling back to the most recent history entry.
+        string? text;
+        if (_settings.Mode == DictationMode.OnCall)
+            text = OnCallSessionText();
+        else
+        {
+            text = _overlay?.CurrentText;
+            if (string.IsNullOrEmpty(text)) text = _history.List().FirstOrDefault()?.Text;
+        }
+        if (!string.IsNullOrEmpty(text))
+            RunOnUi(() => { try { Clipboard.SetText(text!); } catch { } });
+    }
+
+    private void RefreshOpenWindows()
+    {
+        if (_popup is { IsVisible: true }) RunOnUi(() => _popup?.Invalidate());
+    }
+
+    private void NotifyExternallyChanged()
+    {
+        // Keep an open Settings window's controls in sync after a programmatic change.
+        RunOnUi(() =>
+        {
+            _popup?.Invalidate();
+            UpdateTrayStatus();
+            if (_tray?.ContextMenuStrip is { } m) RebuildTrayMenu(m);
+        });
+    }
+
+    private void RunOnUi(Action action)
+    {
+        if (_ui is not null) _ui.Post(_ => action(), null);
+        else action();
+    }
+
+    private static string Trunc(string? s, int n = 40)
+        => string.IsNullOrEmpty(s) ? "" : (s.Length <= n ? s : s[..n] + "…");
+
+    private static bool DetectDark()
+    {
+        try
+        {
+            using var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(
+                @"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize");
+            if (key?.GetValue("AppsUseLightTheme") is int v) return v == 0;
+        }
+        catch { }
+        return true;
+    }
+
+    public void Dispose()
+    {
+        Updater.Cleanup();
+        _hotkey?.Dispose(); _hotkey = null;
+        StopEngine();
+        _overlay?.Dispose(); _overlay = null;
+        _popup?.Close(); _popup = null;
+        _dl?.Close(); _dl = null; _engineDlCts?.Dispose();
+        _launcher?.Close(); _launcher = null;
+        if (_tray is not null) { _tray.Visible = false; _tray.Dispose(); _tray = null; }
+    }
+}

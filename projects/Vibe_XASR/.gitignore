@@ -1,0 +1,40 @@
+# macOS / editor / local config
+.DS_Store
+.claude/
+
+# build artifacts & caches
+.build/
+*.dSYM/
+*.tar.bz2
+macos_build/native/dist/
+
+# local-only eval tools (not shipped)
+tools/
+
+# ASR model payload on Windows is fetched / staged at build time, never committed.
+# Anchored to the payload dir on purpose: a bare `**/models/` also matches the C# source
+# directory windows_build/src/VibeXASR.Windows/Models/ and would drop ModelPaths.cs etc.
+# (windows_build/.gitignore covers the rest of the Windows build output: bin/ obj/ dist/ payload/.)
+windows_build/installer/payload/models/
+
+# Logs / scratch
+*.log
+/tmp/
+
+# stray local archive (do NOT commit — 1.9GB)
+/wind.zip
+
+# Claude 设计工具导出的原始设计对话/上传件 — 不公开(docs 只保留 index.html + 架构图 + appcast.xml)
+docs/chats/
+docs/project/
+docs/uploads/
+docs/README.md
+
+# Local macOS build deps (prebuilt native libs + VAD models — NOT committed; copy in once to build here)
+macos_build/native/sherpa/dist/
+macos_build/native/third_party/onnxruntime/
+macos_build/models/firered/firered_vad.onnx
+macos_build/native/app/Resources/silero_vad.onnx
+# llama.cpp 源码 + 构建产物(库/量化 GGUF)—— 体积大、属构建依赖,不提交;build.sh/convert_to_gguf.sh 保留。
+macos_build/native/llama/llama.cpp/
+macos_build/native/llama/dist/
